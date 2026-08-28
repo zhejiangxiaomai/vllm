@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, ClassVar, Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
@@ -27,6 +28,7 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     flat_kv_row_view,
     triton_convert_req_index_to_global_index,
 )
+from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.xpu_mla_sparse import triton_bf16_mla_sparse_interface
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -41,6 +43,7 @@ class XPUMLASparseBackend(AttentionBackend):
         "auto",
         "float16",
         "bfloat16",
+        "fp8_ds_mla",
     ]
 
     @staticmethod
@@ -80,6 +83,7 @@ class XPUMLASparseMetadata(AttentionMetadata):
 
     num_actual_tokens: int  # Number of tokens excluding padding.
     query_start_loc: torch.Tensor
+    query_start_loc_cpu: torch.Tensor
     slot_mapping: torch.Tensor
 
     block_table: torch.Tensor
@@ -87,6 +91,7 @@ class XPUMLASparseMetadata(AttentionMetadata):
 
     block_size: int = 1
     topk_tokens: int = 2048
+    prefill_max_seq_len: int = 0
 
     # The shared MLA layer (`mla_attention.py::forward_impl`) reads these
     # decode/prefill counts unconditionally for every MLA metadata (it asserts
@@ -104,6 +109,7 @@ class XPUMLASparseMetadata(AttentionMetadata):
     num_decodes: int = 0
     num_prefills: int = 0
     num_decode_tokens: int = 0
+    use_dense_mha_prefill: bool = False
 
 
 @dataclass
@@ -118,6 +124,7 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
         device: torch.device,
     ):
         self.kv_cache_spec = kv_cache_spec
+        self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
         self.device = device
@@ -149,6 +156,24 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> XPUMLASparseMetadata:
+        num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
+            common_attn_metadata,
+            decode_threshold=1,
+            treat_short_extends_as_decodes=True,
+            require_uniform=False,
+        )
+        query_lens = np.diff(
+            np.asarray(common_attn_metadata.query_start_loc_cpu, dtype=np.int32)
+        )
+        seq_lens = np.asarray(common_attn_metadata.seq_lens_cpu_upper_bound)
+        has_cached_prefix = bool(np.any(seq_lens - query_lens > 0))
+        use_dense_mha_prefill = (
+            num_prefills > 0
+            and num_decode_tokens == 0
+            and common_attn_metadata.max_seq_len <= self.topk_tokens
+            and not has_cached_prefix
+            and not self.vllm_config.attention_config.sparse_mla_force_mqa
+        )
         num_tokens = common_attn_metadata.num_actual_tokens
         starts = np.asarray(common_attn_metadata.query_start_loc_cpu, dtype=np.int32)
         seg_lengths = np.diff(starts)
@@ -167,24 +192,27 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
             num_reqs=common_attn_metadata.num_reqs,
             max_query_len=common_attn_metadata.max_query_len,
             max_seq_len=common_attn_metadata.max_seq_len,
+            prefill_max_seq_len=common_attn_metadata.max_seq_len,
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             query_start_loc=common_attn_metadata.query_start_loc,
+            query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
             slot_mapping=common_attn_metadata.slot_mapping,
             block_table=common_attn_metadata.block_table_tensor,
             req_id_per_token=req_id_per_token,
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,
-            # Route every token through the sparse MQA path (see the field
-            # definitions above); this backend has no dense-MHA prefill.
-            num_decodes=common_attn_metadata.num_reqs,
-            num_prefills=0,
-            num_decode_tokens=common_attn_metadata.num_actual_tokens,
+            num_decodes=num_decodes,
+            num_prefills=num_prefills,
+            num_decode_tokens=num_decode_tokens,
+            use_dense_mha_prefill=use_dense_mha_prefill,
         )
         return metadata
 
 
 class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
     is_sparse = True
+    supports_dense_mha_prefill = True
+    masked_mha_available = False
 
     def __init__(
         self,
@@ -209,6 +237,10 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
+        self.qk_nope_head_dim: int = mla_args["qk_nope_head_dim"]
+        self.qk_rope_head_dim: int = mla_args["qk_rope_head_dim"]
+        self.v_head_dim: int = mla_args["v_head_dim"]
+        self.kv_b_proj = mla_args["kv_b_proj"]
         self.softmax_scale = scale
         # The indexer carries the shared buffer for normal layers and tests;
         # the explicitly-passed buffer covers backbone skip layers, whose
@@ -216,6 +248,61 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
         self.topk_indices_buffer: torch.Tensor | None = (
             indexer.topk_indices_buffer if indexer is not None else topk_indices_buffer
         )
+
+    def do_kv_cache_update(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: torch.Tensor,
+    ) -> None:
+        if kv_cache_dtype == "fp8_ds_mla":
+            return
+        super().do_kv_cache_update(
+            kv_c_normed,
+            k_pe,
+            kv_cache,
+            slot_mapping,
+            kv_cache_dtype,
+            k_scale,
+        )
+
+    def forward_mha(
+        self,
+        q: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        attn_metadata: XPUMLASparseMetadata,
+    ) -> torch.Tensor:
+        if not attn_metadata.use_dense_mha_prefill:
+            raise RuntimeError("XPU dense MHA was selected without eligible metadata")
+
+        kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+            -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+        )
+        k_nope, value = kv_nope.split(
+            [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+        )
+        key = torch.cat(
+            [k_nope, k_pe.unsqueeze(1).expand(-1, self.num_heads, -1)], dim=-1
+        )
+        output = torch.empty(
+            (q.shape[0], self.num_heads, self.v_head_dim),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        starts = attn_metadata.query_start_loc_cpu.tolist()
+        for start, end in zip(starts[:-1], starts[1:]):
+            output[start:end] = F.scaled_dot_product_attention(
+                q[start:end].transpose(0, 1).unsqueeze(0),
+                key[start:end].transpose(0, 1).unsqueeze(0),
+                value[start:end].transpose(0, 1).unsqueeze(0),
+                is_causal=True,
+                scale=self.softmax_scale,
+            ).squeeze(0).transpose(0, 1)
+        return output
 
     def _forward_bf16_kv(
         self,
@@ -247,12 +334,6 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
         attn_metadata: XPUMLASparseMetadata,
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # NOTE(lucas): for the sparse FlashMLA kernels the kernels want to use
-        # MQA 576/512 approach for both prefill and decode
-
-        if is_quantized_kv_cache(self.kv_cache_dtype):
-            raise NotImplementedError("FP8 kv is not supported with XPU MLA Sparse yet")
-
         # Concatenate q if it's a tuple (ql_nope, q_pe)
         if isinstance(q, tuple):
             q = torch.cat(q, dim=-1)
@@ -261,6 +342,45 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
+
+        if self.kv_cache_dtype == "fp8_ds_mla":
+            try:
+                from deepklox import flash_mla_with_kvcache
+            except ImportError as error:
+                raise RuntimeError(
+                    "XPU fp8_ds_mla requires DeepKLOX. Add "
+                    "/workspace/applications.ai.gpu.deepklox to PYTHONPATH."
+                ) from error
+
+            _, block_stride_rows = flat_kv_row_view(
+                kv_c_and_k_pe_cache, attn_metadata.block_size
+            )
+            physical_indices = triton_convert_req_index_to_global_index(
+                attn_metadata.req_id_per_token,
+                attn_metadata.block_table,
+                topk_indices,
+                BLOCK_SIZE=attn_metadata.block_size,
+                BLOCK_STRIDE_ROWS=block_stride_rows,
+                NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
+            )
+            output, _ = flash_mla_with_kvcache(
+                q=q.unsqueeze(1),
+                k_cache=kv_c_and_k_pe_cache.view(torch.uint8).unsqueeze(-2).view(
+                    torch.float8_e4m3fn
+                ),
+                block_table=None,
+                cache_seqlens=None,
+                head_dim_v=self.kv_lora_rank,
+                is_fp8_kvcache=True,
+                indices=physical_indices.unsqueeze(1),
+                softmax_scale=self.softmax_scale,
+            )
+            return output.squeeze(1), None
+
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            raise NotImplementedError(
+                f"Unsupported XPU sparse MLA KV cache dtype: {self.kv_cache_dtype}"
+            )
 
         kv_rows, block_stride_rows = flat_kv_row_view(
             kv_c_and_k_pe_cache, attn_metadata.block_size

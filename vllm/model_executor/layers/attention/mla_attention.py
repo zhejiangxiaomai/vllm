@@ -351,7 +351,9 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
     kv_cache_dtype: CacheDType,
 ) -> CacheDType:
     backend_name = attn_backend.get_name()
-    if backend_name == "FLASHMLA_SPARSE" and is_quantized_kv_cache(kv_cache_dtype):
+    if backend_name in ("FLASHMLA_SPARSE", "XPU_MLA_SPARSE") and is_quantized_kv_cache(
+        kv_cache_dtype
+    ):
         return "fp8_ds_mla"
     if backend_name == "FLASHINFER_MLA_SPARSE_SM120" and kv_cache_dtype in (
         "auto",

@@ -404,6 +404,7 @@ class DeepseekV32Attention(MLAAttention):
 
         self._sparse_indexer_and_attn(
             q_c,
+            q,
             index_q_fp8,
             index_k_out,
             index_weights_out,
@@ -419,6 +420,7 @@ class DeepseekV32Attention(MLAAttention):
     def _sparse_indexer_and_attn(
         self,
         q_c: torch.Tensor,
+        q: torch.Tensor,
         index_q_fp8: torch.Tensor | None,
         index_k: torch.Tensor | None,
         index_weights_out: torch.Tensor | None,
@@ -500,13 +502,30 @@ class DeepseekV32Attention(MLAAttention):
 
         if self._fp8_kv_needs_view:
             kv_cache = kv_cache.view(torch.float8_e4m3fn)
+        num_mqa_tokens = attn_metadata.num_decode_tokens
+        num_mha_tokens = num_actual - num_mqa_tokens
+        if num_mha_tokens and attn_metadata.use_dense_mha_prefill:
+            assert kv_c is not None and k_pe is not None
+            dense_output = self.impl.forward_mha(  # type: ignore[attr-defined]
+                q[num_mqa_tokens:num_actual],
+                kv_c[num_mqa_tokens:num_actual],
+                k_pe[num_mqa_tokens:num_actual],
+                attn_metadata,
+            )
+            output[num_mqa_tokens:num_actual].copy_(dense_output.flatten(start_dim=-2))
+        elif num_mha_tokens:
+            num_mqa_tokens = num_actual
+
+        if num_mqa_tokens == 0:
+            return
+
         if self._fp8_query:
             # FlashInfer sparse: single packed fp8 query.
             mqa_q_arg: torch.Tensor | tuple[torch.Tensor, torch.Tensor] = mqa_q[
-                :num_actual
+                :num_mqa_tokens
             ]
         else:
-            mqa_q_arg = (ql_nope[:num_actual], mqa_q[:num_actual])
+            mqa_q_arg = (ql_nope[:num_mqa_tokens], mqa_q[:num_mqa_tokens])
 
         if self.use_pcp and self.impl.dcp_world_size > self.impl.pcp_world_size:
             if isinstance(mqa_q_arg, tuple):
@@ -540,11 +559,11 @@ class DeepseekV32Attention(MLAAttention):
         # we put it here to avoid copying the attention output. Move this back to the
         # captured region once forward_mqa supports `out` argument.
         x = attn_out.view(
-            num_actual, self.num_local_heads, self.kv_lora_rank
+            num_mqa_tokens, self.num_local_heads, self.kv_lora_rank
         ).transpose(0, 1)
         out = (
-            output[:num_actual]
-            .view(num_actual, self.num_local_heads, self.v_head_dim)
+            output[:num_mqa_tokens]
+            .view(num_mqa_tokens, self.num_local_heads, self.v_head_dim)
             .transpose(0, 1)
         )
         torch.bmm(x, self.W_UV, out=out)

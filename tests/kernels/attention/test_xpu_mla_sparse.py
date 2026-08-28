@@ -5,6 +5,10 @@ import pytest
 import torch
 
 from vllm.v1.attention.ops.xpu_mla_sparse import triton_bf16_mla_sparse_interface
+from vllm.v1.attention.backends.mla.xpu_mla_sparse import (
+    XPUMLASparseImpl,
+    XPUMLASparseMetadata,
+)
 
 
 # https://github.com/deepseek-ai/FlashMLA/blob/main/tests/ref.py#L7
@@ -168,3 +172,127 @@ def test_bf16_triton_sparse_mla_masked_chunks(device_str, dtype):
     # lse/max_logits are large-negative finite rather than the reference's
     # +inf/-inf placeholders, so only the output is compared here.
     assert torch.allclose(out[2], torch.zeros_like(out[2]))
+
+
+@pytest.mark.skipif(
+    not torch.xpu.is_available(),
+    reason="XPU is required",
+)
+def test_xpu_dense_mha_short_prefill_is_causal():
+    class KVProjection(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.projection = torch.nn.Linear(4, 2 * (512 + 3), bias=False)
+
+        def forward(self, value: torch.Tensor):
+            return (self.projection(value),)
+
+    device = torch.device("xpu")
+    dtype = torch.bfloat16
+    torch.manual_seed(1234)
+    projection = KVProjection().to(device=device, dtype=dtype)
+    impl = XPUMLASparseImpl(
+        num_heads=2,
+        head_size=576,
+        scale=576**-0.5,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="bfloat16",
+        logits_soft_cap=None,
+        attn_type="decoder",
+        kv_sharing_target_layer_name=None,
+        kv_lora_rank=4,
+        qk_nope_head_dim=512,
+        qk_rope_head_dim=64,
+        v_head_dim=3,
+        kv_b_proj=projection,
+    )
+    metadata = XPUMLASparseMetadata(
+        num_reqs=2,
+        max_query_len=3,
+        max_seq_len=3,
+        num_actual_tokens=5,
+        query_start_loc=torch.tensor([0, 2, 5], device=device, dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 2, 5], dtype=torch.int32),
+        slot_mapping=torch.empty(5, device=device, dtype=torch.long),
+        block_table=torch.empty((2, 1), device=device, dtype=torch.int32),
+        req_id_per_token=torch.tensor([0, 0, 1, 1, 1], device=device, dtype=torch.int32),
+        use_dense_mha_prefill=True,
+    )
+    q = torch.randn((5, 2, 576), device=device, dtype=dtype)
+    kv_c = torch.randn((5, 4), device=device, dtype=dtype)
+    k_pe = torch.randn((5, 64), device=device, dtype=dtype)
+
+    output = impl.forward_mha(q, kv_c, k_pe, metadata)
+    projected = projection(kv_c)[0].view(5, 2, 515)
+    key = torch.cat((projected[..., :512], k_pe.unsqueeze(1).expand(-1, 2, -1)), dim=-1)
+    value = projected[..., 512:]
+    expected = torch.empty_like(output)
+    for start, end in ((0, 2), (2, 5)):
+        scores = torch.einsum("qhd,khd->hqk", q[start:end].float(), key[start:end].float())
+        scores.mul_(576**-0.5)
+        scores.masked_fill_(~torch.ones(end - start, end - start, device=device, dtype=torch.bool).tril(), float("-inf"))
+        expected[start:end] = torch.einsum(
+            "hqk,khd->qhd", torch.softmax(scores, dim=-1), value[start:end].float()
+        ).to(dtype)
+
+    torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(
+    not torch.xpu.is_available(),
+    reason="XPU is required",
+)
+def test_xpu_fp8_ds_mla_routes_to_deepklox(monkeypatch: pytest.MonkeyPatch):
+    pytest.importorskip("deepklox")
+    device = torch.device("xpu")
+    num_tokens, num_heads, topk, block_size = 2, 8, 128, 64
+    impl = XPUMLASparseImpl(
+        num_heads=num_heads,
+        head_size=576,
+        scale=576**-0.5,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="fp8_ds_mla",
+        logits_soft_cap=None,
+        attn_type="decoder",
+        kv_sharing_target_layer_name=None,
+        kv_lora_rank=512,
+        qk_nope_head_dim=512,
+        qk_rope_head_dim=64,
+        v_head_dim=256,
+        kv_b_proj=torch.nn.Identity(),
+        topk_indices_buffer=torch.zeros(
+            (num_tokens, topk), device=device, dtype=torch.int32
+        ),
+    )
+    metadata = XPUMLASparseMetadata(
+        num_reqs=num_tokens,
+        max_query_len=1,
+        max_seq_len=1,
+        num_actual_tokens=num_tokens,
+        query_start_loc=torch.tensor([0, 1, 2], device=device, dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.int32),
+        slot_mapping=torch.empty(num_tokens, device=device, dtype=torch.long),
+        block_table=torch.tensor([[0], [1]], device=device, dtype=torch.int32),
+        req_id_per_token=torch.tensor([0, 1], device=device, dtype=torch.int32),
+        block_size=block_size,
+        topk_tokens=topk,
+        num_decodes=num_tokens,
+        num_decode_tokens=num_tokens,
+    )
+    # A zero-valued, physically contiguous fp8_ds_mla cache is sufficient to
+    # verify the vLLM-to-DeepKLOX layout and routing contract.
+    kv_cache = torch.zeros((2, block_size, 656), device=device, dtype=torch.uint8)
+    q = (
+        torch.randn((num_tokens, num_heads, 512), device=device, dtype=torch.bfloat16),
+        torch.randn((num_tokens, num_heads, 64), device=device, dtype=torch.bfloat16),
+    )
+
+    output, lse = impl.forward_mqa(q, kv_cache, metadata, layer=None)  # type: ignore[arg-type]
+
+    assert lse is None
+    assert output.shape == (num_tokens, num_heads, 512)
+    torch.testing.assert_close(output, torch.zeros_like(output))
